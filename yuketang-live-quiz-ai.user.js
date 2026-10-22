@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         雨课堂 随堂答题 AI 助手 (多接口 / 中转站通用版)
 // @namespace    https://github.com/jzPPP3333/yuketang-live-quiz-ai
-// @version      4.3.0
+// @version      4.4.0
 // @description  实时监听雨课堂随堂试题(WebSocket + DOM 双通道)，调用任意 OpenAI 兼容接口（DeepSeek / OpenAI / 通义 / 硅基流动 / OpenRouter / Kimi / GLM / 中转站 / 本地反代）生成答案，可自动勾选并提交。内置连通性诊断。
 // @author       jzPPP3333
 // @match        https://*.yuketang.cn/*
@@ -28,7 +28,7 @@
    *  0. 常量与默认配置
    * ========================================================================= */
 
-  const VERSION = '4.2.0';
+  const VERSION = '4.4.0';
 
   // 常见服务商预设：baseUrl 一律填 OpenAI 兼容的 /chat/completions 全路径
   // 中转站（one-api / new-api / 自建反代）大多直接兼容 OpenAI 协议，选 custom 自行填写即可
@@ -107,6 +107,7 @@
     maxDelay: 7,
     clickBeforeSubmit: 400, // 勾选后到点击提交之间的间隔 ms
     debug: false,
+    panelMini: false,   // 面板是否缩成悬浮球
   };
 
   const SK = 'ykt_lqa_'; // storage key 前缀
@@ -628,12 +629,23 @@
    *  4. 页面操作层 —— 勾选 / 填空 / 提交
    * ========================================================================= */
 
+  /**
+   * 模拟真实鼠标操作。
+   * 注意：只让 click 事件触发一次 —— 先用 pointer/mouse 系列事件铺垫（兼容 Vue/React 的事件委托
+   * 与某些依赖 mousedown 的组件），最后用原生 click() 收尾。
+   * 若这里既派发合成 'click' 又调 el.click()，监听器会被调用两次，提交按钮可能被重复点击。
+   */
   function fireMouse(el) {
-    ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click'].forEach((type) => {
+    ['pointerover', 'pointerenter', 'mouseover', 'mouseenter',
+     'pointerdown', 'mousedown', 'pointerup', 'mouseup'].forEach((type) => {
       try {
-        el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window }));
-      } catch (e) { /* ignore */ }
+        const Evt = type.startsWith('pointer') ? PointerEvent : MouseEvent;
+        el.dispatchEvent(new Evt(type, { bubbles: true, cancelable: true, view: window, button: 0 }));
+      } catch (e) {
+        try { el.dispatchEvent(new MouseEvent(type, { bubbles: true, cancelable: true, view: window })); } catch (e2) { /* ignore */ }
+      }
     });
+    // 原生 click：只触发一次，且带默认行为（label→input 等）
     try { el.click(); } catch (e) { /* ignore */ }
   }
 
@@ -655,8 +667,11 @@
       return true;
     }
     fireMouse(target.el);
+    // 容器点击若未联动到内部 input（常见于自定义 radio），再补一次；已选中则跳过，避免多选被反选
     const input = target.el.querySelector('input[type="radio"],input[type="checkbox"]');
-    if (input && !input.checked) fireMouse(input);
+    if (input && !input.checked) {
+      try { input.click(); } catch (e) { /* ignore */ }
+    }
     return true;
   }
 
@@ -721,7 +736,62 @@
     lastError: '',
     status: '待命',
     panel: null,
+    // —— 可视面板用 ——
+    minimized: false,
+    channels: { ws: false, fetch: false, dom: false },
+    capturedCount: 0,          // 累计捕获题目数
+    history: [],               // 答题历史，最多保留 30 条
+    latency: [],               // 最近若干次 AI 往返耗时 ms
+    countdown: null,           // { total, left, timer }
+    lessonKey: '',
   };
+
+  /** 写一条答题历史 */
+  function pushHistory(entry) {
+    state.history.unshift(Object.assign({ time: Date.now() }, entry));
+    if (state.history.length > 30) state.history.length = 30;
+    renderHistory();
+  }
+
+  /** 记录一次 AI 往返耗时 */
+  function pushLatency(ms) {
+    if (!Number.isFinite(ms) || ms <= 0) return;
+    state.latency.push(ms);
+    if (state.latency.length > 20) state.latency.shift();
+    renderPanelStats();
+  }
+
+  function avgLatency() {
+    if (!state.latency.length) return 0;
+    return Math.round(state.latency.reduce((a, b) => a + b, 0) / state.latency.length);
+  }
+
+  /** 提交前倒计时进度条 */
+  function startCountdown(totalMs, onDone) {
+    cancelCountdown();
+    const bar = document.getElementById('yktai-progress-bar');
+    const wrap = document.getElementById('yktai-progress');
+    if (wrap) wrap.hidden = false;
+    const started = Date.now();
+    const tick = () => {
+      const left = Math.max(0, totalMs - (Date.now() - started));
+      if (bar) bar.style.width = (100 * (1 - left / totalMs)).toFixed(1) + '%';
+      const label = document.getElementById('yktai-progress-label');
+      if (label) label.textContent = left > 0 ? (left / 1000).toFixed(1) + ' 秒后提交' : '正在提交…';
+      if (left <= 0) { cancelCountdown(true); onDone && onDone(); }
+    };
+    state.countdown = { total: totalMs, timer: setInterval(tick, 100), done: false };
+    tick();
+  }
+
+  function cancelCountdown(keepBar) {
+    if (state.countdown && state.countdown.timer) clearInterval(state.countdown.timer);
+    state.countdown = null;
+    if (!keepBar) {
+      const wrap = document.getElementById('yktai-progress');
+      if (wrap) wrap.hidden = true;
+    }
+  }
 
   function fingerprintOf(q) {
     const base = (q.text || '').replace(/\s+/g, '') + '|' + q.options.map((o) => o.text.replace(/\s+/g, '')).join('|');
@@ -737,6 +807,9 @@
       box.textContent = text;
       box.style.color = tone === 'ok' ? '#86efac' : tone === 'err' ? '#fca5a5' : tone === 'warn' ? '#fde047' : '#cbd5e1';
     }
+    // 顶部状态灯同步：err 红 / 工作中黄闪 / 其余绿
+    setDot(tone === 'err' ? 'err' : (state.busy && tone === 'warn') ? 'busy' : 'on');
+    if (tone === 'ok') beatBadge();
   }
 
   function setAnswerBox(text) {
@@ -764,10 +837,12 @@
     state.busy = true;
     state.processing.add(fp);
     state.lastFingerprint = fp;
+    state.capturedCount += 1;
     setStatus('已捕获题目（' + (triggerSource || 'DOM') + '），请求 AI…', 'warn');
     log('题目解析结果', q);
 
     const prompt = buildPrompt(q);
+    const t0 = Date.now();
 
     callAPI(prompt, (err, answerText) => {
       if (err) {
@@ -775,8 +850,10 @@
         state.lastError = err.message;
         setStatus('AI 请求失败：' + err.message.split('\n')[0], 'err');
         setAnswerBox(err.message + '\n\n可点「🩺 诊断」逐项排查。');
+        pushHistory({ summary: shorten(q.text.replace(/\s+/g, ' '), 40), answer: '-', state: 'AI失败', type: q.type });
         return;
       }
+      pushLatency(Date.now() - t0);
 
       const parsed = parseAnswer(answerText, q);
       const display = parsed.kind === 'choice' ? '答案：' + parsed.value.join('') : '答案：' + parsed.value;
@@ -787,6 +864,7 @@
         state.busy = false;
         setStatus('已给出参考答案（未开启自动提交）', 'ok');
         notify('雨课堂随堂题', display);
+        pushHistory({ summary: shorten(q.text.replace(/\s+/g, ' '), 40), answer: display, state: '仅参考答案', type: q.type });
         return;
       }
 
@@ -795,7 +873,7 @@
         : 0;
       setStatus('AI 已作答，' + (delay / 1000).toFixed(1) + ' 秒后自动提交…', 'warn');
 
-      setTimeout(() => {
+      const doSubmit = () => {
         try {
           // 重新抓一次 DOM（弹窗可能已重渲染）
           const m2 = pickVisibleModal() || modal;
@@ -813,6 +891,7 @@
           if (!ok) {
             setStatus('答案已生成，但页面上没找到可操作的控件，请手动作答', 'warn');
             notify('雨课堂随堂题（需手动）', display);
+            pushHistory({ summary: shorten(q.text.replace(/\s+/g, ' '), 40), answer: display, state: '需手动', type: q.type });
             state.busy = false;
             return;
           }
@@ -827,14 +906,25 @@
             } else {
               setStatus('已勾选答案，但提交按钮未找到，请手动点提交', 'warn');
             }
+            pushHistory({
+              summary: shorten(q.text.replace(/\s+/g, ' '), 40),
+              answer: display,
+              state: submitted ? '已提交' : '待手动提交',
+              type: q.type,
+            });
             renderPanelStats();
           }, Number(settings.clickBeforeSubmit) || 400);
         } catch (e) {
           state.busy = false;
           warn('自动作答异常', e);
           setStatus('自动作答异常：' + e.message, 'err');
+          pushHistory({ summary: shorten(q.text.replace(/\s+/g, ' '), 40), answer: '-', state: '异常', type: q.type });
         }
-      }, delay);
+      };
+
+      // 有延时就走进度条倒计时，没延时立即执行
+      if (delay > 0) startCountdown(delay, doSubmit);
+      else doSubmit();
     });
   }
 
@@ -864,6 +954,8 @@
       });
       window.WebSocket = ProxyWS;
       window.__YKT_AI_WS__ = true;
+      state.channels.ws = true;
+      renderChannels();
       log('WebSocket Hook 已安装');
     } catch (e) {
       warn('WebSocket Hook 安装失败', e);
@@ -913,6 +1005,8 @@
         },
       });
       window.__YKT_AI_FETCH__ = true;
+      state.channels.fetch = true;
+      renderChannels();
       log('Fetch Hook 已安装');
     } catch (e) {
       warn('Fetch Hook 安装失败', e);
@@ -943,6 +1037,8 @@
       new MutationObserver(debounce).observe(document.documentElement, { childList: true, subtree: true });
     } catch (e) { /* ignore */ }
     setInterval(tick, 3000);
+    state.channels.dom = true;
+    renderChannels();
     log('DOM 轮询已启动');
   }
 
@@ -969,18 +1065,35 @@
    * ========================================================================= */
 
   const CSS = `
-#yktai-panel{position:fixed;right:18px;bottom:18px;z-index:2147483000;width:320px;
+#yktai-panel{position:fixed;right:18px;bottom:18px;z-index:2147483000;width:330px;
   font:13px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Microsoft YaHei",sans-serif;
   color:#e2e8f0;background:linear-gradient(160deg,#0f172a,#1e293b);
   border:1px solid rgba(148,163,184,.28);border-radius:14px;box-shadow:0 16px 48px rgba(0,0,0,.5);
-  user-select:none;overflow:hidden}
+  user-select:none;overflow:hidden;transition:width .18s,height .18s,border-radius .18s}
 #yktai-panel *{box-sizing:border-box}
 #yktai-panel .hd{display:flex;align-items:center;justify-content:space-between;
-  padding:10px 12px;cursor:move;background:rgba(255,255,255,.04);font-weight:700;font-size:13px}
+  padding:9px 12px;cursor:move;background:rgba(255,255,255,.05);font-weight:700;font-size:13px;
+  border-bottom:1px solid rgba(148,163,184,.14)}
 #yktai-panel .hd .dot{width:8px;height:8px;border-radius:50%;background:#4ade80;margin-right:7px;
-  display:inline-block;box-shadow:0 0 8px #4ade80}
-#yktai-panel .bd{padding:10px 12px 12px;max-height:74vh;overflow:auto}
+  display:inline-block;box-shadow:0 0 8px #4ade80;transition:background .2s,box-shadow .2s}
+#yktai-panel .hd .dot.idle{background:#64748b;box-shadow:none}
+#yktai-panel .hd .dot.busy{background:#fbbf24;box-shadow:0 0 8px #fbbf24;animation:yktai-pulse .8s infinite}
+#yktai-panel .hd .dot.err{background:#f87171;box-shadow:0 0 8px #f87171}
+@keyframes yktai-pulse{50%{opacity:.35}}
+#yktai-panel .hd .hbtn{padding:1px 7px;font-size:14px;line-height:1.3;border-radius:6px;
+  border:1px solid rgba(148,163,184,.35);background:rgba(255,255,255,.06);color:#cbd5e1;cursor:pointer}
+#yktai-panel .hd .hbtn:hover{background:rgba(74,222,128,.2);color:#fff}
+#yktai-panel .bd{padding:10px 12px 12px;max-height:76vh;overflow:auto}
 #yktai-panel .bd.hide{display:none}
+#yktai-panel.mini{width:52px;height:52px;border-radius:50%}
+#yktai-panel.mini .hd{padding:0;height:52px;justify-content:center;cursor:pointer;border:none}
+#yktai-panel.mini .hd .title,#yktai-panel.mini .hd .hbtn{display:none}
+#yktai-panel.mini .bd{display:none}
+#yktai-panel.mini .badge{position:absolute;top:-3px;right:-3px;min-width:18px;height:18px;
+  border-radius:9px;background:#ef4444;color:#fff;font-size:10px;line-height:18px;text-align:center;
+  padding:0 4px;display:none}
+#yktai-panel.mini.beat{animation:yktai-beat .5s}
+@keyframes yktai-beat{50%{transform:scale(1.14)}}
 #yktai-panel label{display:block;margin:8px 0 3px;font-size:11px;color:#94a3b8}
 #yktai-panel input[type=text],#yktai-panel input[type=password],#yktai-panel input[type=number],
 #yktai-panel textarea,#yktai-panel select{
@@ -995,14 +1108,104 @@
 #yktai-panel button:hover{background:rgba(74,222,128,.18)}
 #yktai-panel button.on{background:rgba(74,222,128,.28);border-color:rgba(74,222,128,.6)}
 #yktai-panel button:disabled{opacity:.45;cursor:not-allowed}
+/* —— 统计块 —— */
+.yktai-cards{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-top:8px}
+.yktai-card{background:rgba(255,255,255,.05);border:1px solid rgba(148,163,184,.18);
+  border-radius:8px;padding:6px 4px;text-align:center}
+.yktai-card .v{font-size:15px;font-weight:700;color:#7dd3fc;line-height:1.2}
+.yktai-card .k{font-size:9px;color:#64748b;margin-top:1px}
+/* —— 通道指示灯 —— */
+.yktai-ch{display:flex;gap:5px;margin-top:7px;flex-wrap:wrap}
+.yktai-ch span{font-size:9px;padding:2px 6px;border-radius:20px;
+  background:rgba(255,255,255,.05);border:1px solid rgba(148,163,184,.2);color:#64748b}
+.yktai-ch span.ok{color:#86efac;border-color:rgba(74,222,128,.45);background:rgba(74,222,128,.12)}
+/* —— 进度条 —— */
+#yktai-progress{margin-top:8px}
+#yktai-progress-track{height:6px;border-radius:3px;background:rgba(255,255,255,.08);overflow:hidden}
+#yktai-progress-bar{height:100%;width:0;border-radius:3px;
+  background:linear-gradient(90deg,#22c55e,#4ade80,#a3e635);transition:width .1s linear}
+#yktai-progress-label{font-size:10px;color:#86efac;margin-top:3px;text-align:center}
+/* —— 历史列表 —— */
+#yktai-history{margin-top:8px;max-height:150px;overflow:auto}
+.yktai-hi{display:flex;align-items:flex-start;gap:6px;padding:4px 0;
+  border-bottom:1px dashed rgba(148,163,184,.12);font-size:10px;line-height:1.4}
+.yktai-hi:last-child{border-bottom:none}
+.yktai-hi .t{color:#475569;flex-shrink:0;font-variant-numeric:tabular-nums}
+.yktai-hi .q{flex:1;color:#cbd5e1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.yktai-hi .a{color:#7dd3fc;flex-shrink:0;font-weight:600}
+.yktai-hi .s{flex-shrink:0;font-size:9px;padding:0 4px;border-radius:4px}
+.yktai-hi .s.ok{background:rgba(74,222,128,.16);color:#86efac}
+.yktai-hi .s.warn{background:rgba(251,191,36,.16);color:#fde047}
+.yktai-hi .s.err{background:rgba(248,113,113,.16);color:#fca5a5}
 #yktai-status{margin-top:8px;font-size:11px;color:#cbd5e1;word-break:break-all}
 #yktai-answer{margin-top:8px;padding:8px;border-radius:8px;background:rgba(0,0,0,.35);
   font-size:11px;color:#a5f3fc;white-space:pre-wrap;word-break:break-word;max-height:170px;overflow:auto;user-select:text}
-#yktai-stats{margin-top:6px;font-size:11px;color:#64748b}
+#yktai-stats{margin-top:6px;font-size:10px;color:#475569;word-break:break-all}
 .acc{border-top:1px dashed rgba(148,163,184,.25);margin-top:10px;padding-top:8px}
 .acc summary{cursor:pointer;font-size:11px;color:#94a3b8;outline:none}
 .acc[open] summary{color:#a5f3fc}
 `;
+
+  /* —— 局部刷新：只改统计/通道/历史，不重绘整个面板，避免输入框丢焦点 —— */
+  function renderPanelStats() {
+    const cap = document.getElementById('yktai-cap');
+    const sol = document.getElementById('yktai-sol');
+    const lat = document.getElementById('yktai-lat');
+    if (cap) cap.textContent = state.capturedCount;
+    if (sol) sol.textContent = state.solvedCount;
+    if (lat) lat.textContent = state.latency.length ? avgLatency() + 'ms' : '—';
+    const s = document.getElementById('yktai-stats');
+    if (s) s.textContent = '接口 ' + shorten(settings.baseUrl || '(未配置)', 46) + ' · 模型 ' + (settings.model || '—');
+  }
+
+  function renderChannels() {
+    const box = document.getElementById('yktai-ch');
+    if (!box) return;
+    const items = [
+      ['WS', state.channels.ws],
+      ['FETCH', state.channels.fetch],
+      ['DOM', state.channels.dom],
+    ];
+    box.innerHTML = items.map(([k, v]) =>
+      '<span class="' + (v ? 'ok' : '') + '">' + (v ? '● ' : '○ ') + k + '</span>').join('');
+  }
+
+  function renderHistory() {
+    const box = document.getElementById('yktai-history');
+    if (!box) return;
+    if (!state.history.length) {
+      box.innerHTML = '<div style="font-size:10px;color:#475569;text-align:center;padding:6px 0">还没有答题记录</div>';
+      return;
+    }
+    box.innerHTML = state.history.slice(0, 12).map((h) => {
+      const d = new Date(h.time);
+      const t = String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+      const cls = h.state === '已提交' ? 'ok' : (h.state === '待手动提交' || h.state === '需手动' || h.state === '仅参考答案') ? 'warn' : 'err';
+      const esc = (x) => String(x).replace(/[<>&"]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', '"': '&quot;' }[c]));
+      return '<div class="yktai-hi">' +
+        '<span class="t">' + t + '</span>' +
+        '<span class="q" title="' + esc(h.summary) + '">' + esc(h.summary) + '</span>' +
+        '<span class="a">' + esc(String(h.answer).replace(/^答案：/, '')) + '</span>' +
+        '<span class="s ' + cls + '">' + esc(h.state) + '</span>' +
+        '</div>';
+    }).join('');
+  }
+
+  function setDot(mode) {
+    const dot = document.querySelector('#yktai-panel .hd .dot');
+    if (!dot) return;
+    dot.className = 'dot' + (mode === 'busy' ? ' busy' : mode === 'err' ? ' err' : mode === 'idle' ? ' idle' : '');
+  }
+
+  function beatBadge() {
+    const panel = document.getElementById('yktai-panel');
+    if (!panel || !panel.classList.contains('mini')) return;
+    panel.classList.add('beat');
+    setTimeout(() => panel.classList.remove('beat'), 520);
+    const b = panel.querySelector('.badge');
+    if (b) { b.style.display = 'block'; b.textContent = String(state.solvedCount || '!'); }
+  }
+
 
   function el(tag, attrs, children) {
     const node = document.createElement(tag);
@@ -1015,12 +1218,6 @@
     });
     (children || []).forEach((c) => node.appendChild(c));
     return node;
-  }
-
-  function renderPanelStats() {
-    const s = document.getElementById('yktai-stats');
-    if (!s) return;
-    s.textContent = '已解题 ' + state.solvedCount + ' 题 · 接口 ' + shorten((settings.baseUrl || ''), 34);
   }
 
   function shorten(s, n) {
@@ -1146,13 +1343,35 @@
 
     bd.appendChild(acc);
 
-    // —— 状态 / 答案 / 统计 ——
+    // —— 实时状态卡：捕获 / 提交 / 平均耗时 ——
+    const cards = el('div', { class: 'yktai-cards' });
+    cards.appendChild(el('div', { class: 'yktai-card', html: '<div class="v" id="yktai-cap">0</div><div class="k">已捕获</div>' }));
+    cards.appendChild(el('div', { class: 'yktai-card', html: '<div class="v" id="yktai-sol">0</div><div class="k">已提交</div>' }));
+    cards.appendChild(el('div', { class: 'yktai-card', html: '<div class="v" id="yktai-lat">—</div><div class="k">平均耗时</div>' }));
+    bd.appendChild(cards);
+
+    // —— 监听通道指示灯 ——
+    bd.appendChild(el('div', { class: 'yktai-ch', id: 'yktai-ch' }));
+
+    // —— 提交倒计时进度条 ——
+    bd.appendChild(el('div', {
+      id: 'yktai-progress',
+      hidden: '',
+      html: '<div id="yktai-progress-track"><div id="yktai-progress-bar"></div></div>' +
+            '<div id="yktai-progress-label"></div>',
+    }));
+
+    // —— 状态文本 / 答案框 ——
     bd.appendChild(el('div', { id: 'yktai-status', text: state.status }));
     const ansBox = el('div', { id: 'yktai-answer' });
     ansBox.hidden = !state.lastAnswer;
     ansBox.textContent = state.lastAnswer;
     bd.appendChild(ansBox);
     bd.appendChild(el('div', { id: 'yktai-stats' }));
+
+    // —— 答题历史 ——
+    bd.appendChild(el('label', { text: '答题记录（最近 12 条）' }));
+    bd.appendChild(el('div', { id: 'yktai-history' }));
 
     // —— 操作按钮 ——
     const ops = el('div', { class: 'btns' });
@@ -1176,12 +1395,42 @@
     }));
     ops.appendChild(el('button', {
       text: '♻️ 清空记录',
-      onclick: () => { state.processing.clear(); state.solvedCount = 0; setStatus('已清空处理记录'); renderPanelStats(); },
+      onclick: () => {
+        state.processing.clear();
+        state.solvedCount = 0;
+        state.capturedCount = 0;
+        state.history = [];
+        state.latency = [];
+        setStatus('已清空处理记录');
+        renderPanelStats();
+        renderHistory();
+      },
+    }));
+    ops.appendChild(el('button', {
+      text: '📋 复制记录',
+      title: '把答题历史复制为文本',
+      onclick: async () => {
+        if (!state.history.length) { setStatus('暂无记录可复制', 'warn'); return; }
+        const txt = state.history.map((h) => {
+          const d = new Date(h.time);
+          const t = [d.getHours(), d.getMinutes(), d.getSeconds()].map((n) => String(n).padStart(2, '0')).join(':');
+          return t + '  ' + h.summary + '  →  ' + String(h.answer).replace(/^答案：/, '') + '  [' + h.state + ']';
+        }).join('\n');
+        try {
+          await navigator.clipboard.writeText(txt);
+          setStatus('已复制 ' + state.history.length + ' 条记录到剪贴板', 'ok');
+        } catch (e) {
+          setAnswerBox(txt);
+          setStatus('剪贴板不可用，已输出到上方文本框', 'warn');
+        }
+      },
     }));
     bd.appendChild(ops);
 
     bd.scrollTop = scrollTop;
     renderPanelStats();
+    renderChannels();
+    renderHistory();
     setStatus(state.status);
     setAnswerBox(state.lastAnswer);
   }
@@ -1221,29 +1470,48 @@
 
     const panel = el('div', { id: 'yktai-panel' });
     const hd = el('div', { class: 'hd' });
-    hd.innerHTML = '<span><span class="dot"></span>雨课堂 AI 助手 v' + VERSION + '</span>';
-    const minBtn = el('button', { text: '—', title: '折叠', style: 'padding:2px 8px' });
-    minBtn.addEventListener('click', () => {
-      const bd = panel.querySelector('.bd');
-      bd.classList.toggle('hide');
-      minBtn.textContent = bd.classList.contains('hide') ? '+' : '—';
-    });
-    hd.appendChild(minBtn);
+    hd.innerHTML =
+      '<span class="title"><span class="dot idle"></span>雨课堂 AI 助手 v' + VERSION + '</span>' +
+      '<span>' +
+        '<button class="hbtn" id="yktai-mini" title="收成悬浮球">◍</button>' +
+        '<button class="hbtn" id="yktai-collapse" title="折叠内容">—</button>' +
+      '</span>';
+    panel.appendChild(hd);
+    panel.appendChild(el('span', { class: 'badge' }));
 
     const bd = el('div', { class: 'bd' });
-    panel.appendChild(hd);
     panel.appendChild(bd);
 
-    // 拖拽
+    // 悬浮球 / 展开
+    hd.querySelector('#yktai-mini').addEventListener('click', (e) => {
+      e.stopPropagation();
+      toggleMini(!panel.classList.contains('mini'));
+    });
+    // 折叠正文
+    hd.querySelector('#yktai-collapse').addEventListener('click', (e) => {
+      e.stopPropagation();
+      bd.classList.toggle('hide');
+      hd.querySelector('#yktai-collapse').textContent = bd.classList.contains('hide') ? '+' : '—';
+    });
+    // 悬浮球状态下点标题也能展开
+    hd.addEventListener('click', (e) => {
+      if (!panel.classList.contains('mini')) return;
+      if (e.target.closest('button')) return;
+      toggleMini(false);
+    });
+
+    // 拖拽（拖动超过 4px 才判定为拖动，避免误触）
     let drag = null;
     hd.addEventListener('pointerdown', (e) => {
       if (e.target.closest('button')) return;
       const r = panel.getBoundingClientRect();
-      drag = { x: e.clientX - r.left, y: e.clientY - r.top };
+      drag = { x: e.clientX - r.left, y: e.clientY - r.top, moved: false, sx: e.clientX, sy: e.clientY };
       hd.setPointerCapture(e.pointerId);
     });
     hd.addEventListener('pointermove', (e) => {
       if (!drag) return;
+      if (!drag.moved && Math.abs(e.clientX - drag.sx) + Math.abs(e.clientY - drag.sy) < 4) return;
+      drag.moved = true;
       panel.style.left = Math.max(0, e.clientX - drag.x) + 'px';
       panel.style.top = Math.max(0, e.clientY - drag.y) + 'px';
       panel.style.right = 'auto';
@@ -1253,8 +1521,37 @@
 
     document.body.appendChild(panel);
     state.panel = panel;
+
+    // 恢复上次的迷你状态
+    if (settings.panelMini) toggleMini(true, true);
     renderPanel();
     log('面板已创建');
+  }
+
+  function toggleMini(on, silent) {
+    const panel = document.getElementById('yktai-panel');
+    if (!panel) return;
+    const bd = panel.querySelector('.bd');
+    const badge = panel.querySelector('.badge');
+    panel.classList.toggle('mini', on);
+    if (on) {
+      if (badge) badge.style.display = state.solvedCount ? 'block' : 'none';
+      if (badge) badge.textContent = String(state.solvedCount);
+      // 缩成球时收拢到右下角，避免遮挡
+      panel.style.left = 'auto';
+      panel.style.top = 'auto';
+      panel.style.right = '18px';
+      panel.style.bottom = '18px';
+    } else {
+      if (badge) badge.style.display = 'none';
+      if (bd) bd.classList.remove('hide');
+      const cb = panel.querySelector('#yktai-collapse');
+      if (cb) cb.textContent = '—';
+    }
+    if (!silent) {
+      settings.panelMini = on;
+      GM_setValue(SK + 'panelMini', on);
+    }
   }
 
   /* =========================================================================
