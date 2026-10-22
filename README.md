@@ -1,8 +1,9 @@
 # 雨课堂 随堂答题 AI 助手（多接口 / 中转站通用版）
 
-一个 Tampermonkey 用户脚本：实时监听雨课堂课堂里老师弹出的**随堂试题**，调用**任意 OpenAI 兼容接口**生成答案，并按需自动勾选、自动提交。
+一个 Tampermonkey 用户脚本：实时监听雨课堂课堂里老师弹出的**随堂试题**，调用**任意 OpenAI 兼容接口**生成答案，并自动勾选、自动提交。
 
-> 与原版脚本最大的区别：**不再绑定 DeepSeek**。DeepSeek、OpenAI、通义千问、硅基流动、OpenRouter、Kimi、智谱 GLM、火山方舟，以及任何 one-api / new-api / 自建反代**中转站**、本地反代，全部可用。
+> 本项目在原版脚本基础上做了两处核心改进：**API 接入全面放开**（不再限定 DeepSeek，任何 OpenAI 兼容服务与中转站都能接），**答题流程全自动**（自动捕获、自动选择、自动提交，并带排障与面板可视化）。
+> 原版出处：[shy7890/yuketang-ws-quiz-notifier](https://github.com/shy7890/yuketang-ws-quiz-notifier)
 
 ## ⚡ 一键安装
 
@@ -15,17 +16,33 @@
 
 ---
 
-## 一、和旧版的差异
+## 一、相比原版的改进
 
-| 项目 | 旧版（DeepSeek 专用） | 本版 v4.3 |
+### 1. API 接入：从「只能 DeepSeek」到「任意 OpenAI 兼容」
+
+| 能力 | 原版 | 本版 |
 | --- | --- | --- |
-| 接口地址 | 硬编码 `api.deepseek.com` | 任意 OpenAI 兼容地址，可填中转站 |
-| 模型名 | 仅 `deepseek-chat` / `deepseek-reasoner` | 任意模型名，带常用模型快捷按钮 |
-| 鉴权 | 固定 `Bearer` | 支持额外请求头（自定义鉴权 Header） |
-| 请求体 | 固定字段 | 支持 `extraBody` 合并任意字段（`top_p`、`thinking` 等） |
-| 响应解析 | 只认 `choices[0].message.content` | 兼容 `content` 数组 / `reasoning_content` / `data` 包裹 / Anthropic 原生 |
-| 配置方式 | 改代码 | 可视化面板 + GM 存储，改完即生效 |
-| 排障 | 只有一句「网络错误」 | 「🩺 诊断」三步定位：地址 → 端口 → 鉴权 → 模型 |
+| 接口地址 | 固定 `api.deepseek.com` | 任意 OpenAI 兼容地址，可填中转站、本地反代 |
+| 服务商 | 仅 DeepSeek | DeepSeek / OpenAI / 通义百炼 / 硅基流动 / OpenRouter / Kimi / 智谱 GLM / 火山方舟 + 自定义 |
+| 模型名 | 固定两三个 | 任意模型名，面板内快捷切换，诊断时自动列出服务端真实可用模型 |
+| 鉴权方式 | 固定 `Bearer` | 支持自定义鉴权头（`x-api-key`、`api-key` 等） |
+| 请求体 | 固定字段 | 支持 `extraBody` 合并任意字段（`top_p`、`enable_thinking`、`thinking` 等） |
+| 响应解析 | 只认 `choices[0].message.content` | 兼容 `content` 数组 / `reasoning_content` / `{data:{...}}` 包裹 / Anthropic `content[]` |
+| 地址容错 | 需填完整路径 | 只填 `host:port` 或 `/v1` 自动补全；本地地址默认 `http`，公网默认 `https` |
+| 配置方式 | 改代码 | 可视化面板 + 本地存储，改完即生效 |
+| 连通性排查 | 单一报错文本 | 「🩺 诊断」三步：地址归一化 → 端口存活 → 鉴权 → 模型 |
+
+### 2. 答题流程：从「只提醒」到「全自动选择 + 自动提交」
+
+| 环节 | 原版 | 本版 |
+| --- | --- | --- |
+| 题目捕获 | WebSocket + DOM | 三通道并行：WebSocket + Fetch Hook + DOM 轮询 |
+| 作答动作 | 仅在浮窗显示参考答案，需人工点选 | 自动点击选项（单选 / 多选 / 判断）、自动填填空、自动点提交 |
+| 防风控 | 无 | 提交前随机延时（默认 3–7 秒）+ 进度条倒计时 |
+| 重复作答 | 无去重 | 题干+选项指纹去重，翻页 / 重连不重复作答 |
+| 失误保护 | — | 找不到可点控件时不强行操作，只给答案并提示手动 |
+| 提交可靠性 | — | 模拟点击只触发一次 `click`，避免重复提交 |
+| 过程可见性 | 通知为主 | 状态灯 / 统计卡 / 通道灯 / 进度条 / 答题记录 / 悬浮球 |
 
 ---
 
@@ -35,7 +52,7 @@
 
 1. 浏览器安装 [Tampermonkey](https://www.tampermonkey.net/)（篡改猴 / 油猴）。
 2. 点上面的 **👉 点我安装脚本**，Tampermonkey 弹出确认页，点「安装」。
-3. 打开雨课堂网页版授课页面（`https://*.yuketang.cn/*`），右下角出现 **雨课堂 AI 助手 v4.3.0** 面板即成功。
+3. 打开雨课堂网页版授课页面（`https://*.yuketang.cn/*`），右下角出现 **雨课堂 AI 助手 v4.4.0** 面板即成功。
 
 ### 方式 B：手动
 
@@ -84,6 +101,10 @@ Tampermonkey → 添加新脚本 → 清空模板 → 粘贴 [`yuketang-live-qui
 ```json
 {"top_p": 0.9, "enable_thinking": false}
 ```
+
+### 3.3 内网 / 本地反代
+
+配合 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)、[allproxyapi](https://github.com/jzPPP3333/allproxyapi)、LiteLLM、one-api 等自建网关完全可用，地址填 `http://127.0.0.1:8317/v1/chat/completions` 这类本机地址即可（Tampermonkey 的 `@connect *` 已放开跨域）。
 
 ---
 
@@ -243,7 +264,7 @@ A：它只允许 Tampermonkey 向你在面板里填写的地址发请求，不�
 A：雨课堂部分班型的选项不是标准 `el-radio` / `el-checkbox`，脚本找不到可点元素。此时面板提示「页面上没找到可操作的控件」，参考答案仍显示，手动点一下即可。
 
 **Q：选「自定义 / 中转站」后地址被清空了？**
-A：v4.3 起切到「自定义」会保留你已填的地址，只有原本还是示例占位地址时才会清空。
+A：切到「自定义 / 中转站」会保留你已填的地址，只有原本还是示例占位地址时才会清空。
 
 ---
 
@@ -262,6 +283,11 @@ yuketang-live-quiz-ai/
 
 本项目仅供**个人学习与技术研究**，用于理解 WebSocket 拦截、DOM 自动化与多服务商 API 适配等前端工程实践。
 使用者需自行遵守所在学校、课程及雨课堂平台的学术诚信与使用规范，由此产生的一切后果由使用者自行承担。
+
+## 十、致谢
+
+- 原版脚本：[shy7890/yuketang-ws-quiz-notifier](https://github.com/shy7890/yuketang-ws-quiz-notifier)，提供了 WebSocket 事件拦截、题目 DOM 解析与提醒机制的基础实现
+- 本项目在其基础上扩展了多服务商 API 适配层、自动作答与提交逻辑、三步连通性诊断与面板可视化
 
 ## License
 
