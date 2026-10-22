@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         雨课堂 随堂答题 AI 助手 (多接口 / 中转站通用版)
 // @namespace    https://github.com/jzPPP3333/yuketang-live-quiz-ai
-// @version      4.2.0
-// @description  实时监听雨课堂随堂试题(WebSocket + DOM 双通道)，调用任意 OpenAI 兼容接口（DeepSeek / OpenAI / 通义 / 硅基流动 / OpenRouter / Kimi / GLM / 中转站）生成答案，可自动勾选并提交。
+// @version      4.3.0
+// @description  实时监听雨课堂随堂试题(WebSocket + DOM 双通道)，调用任意 OpenAI 兼容接口（DeepSeek / OpenAI / 通义 / 硅基流动 / OpenRouter / Kimi / GLM / 中转站 / 本地反代）生成答案，可自动勾选并提交。内置连通性诊断。
 // @author       jzPPP3333
 // @match        https://*.yuketang.cn/*
 // @match        https://*.xuetangx.com/*
@@ -15,6 +15,8 @@
 // @grant        GM_notification
 // @grant        GM_registerMenuCommand
 // @connect      *
+// @updateURL    https://raw.githubusercontent.com/jzPPP3333/yuketang-live-quiz-ai/main/yuketang-live-quiz-ai.user.js
+// @downloadURL  https://raw.githubusercontent.com/jzPPP3333/yuketang-live-quiz-ai/main/yuketang-live-quiz-ai.user.js
 // @run-at       document-start
 // @noframes     false
 // ==/UserScript==
@@ -151,12 +153,20 @@
   function normalizeEndpoint(raw) {
     let url = String(raw || '').trim();
     if (!url) return '';
-    if (!/^https?:\/\//i.test(url)) url = 'https://' + url;
     url = url.replace(/\s+/g, '');
-    if (/\/chat\/completions\/?$/i.test(url)) return url.replace(/\/$/, '');
-    // 兼容部分中转站给出的 /v1/chat/completions 变体
-    if (/\/completions\/?$/i.test(url) && !/chat/i.test(url)) return url.replace(/\/$/, '');
-    return url.replace(/\/+$/, '') + '/chat/completions';
+    if (!/^https?:\/\//i.test(url)) {
+      // 本地/内网地址默认 http，公网默认 https
+      const isLocal = /^(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\]|10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/i.test(url);
+      url = (isLocal ? 'http://' : 'https://') + url;
+    }
+    // 只填了根路径 / 端口：补标准 OpenAI 路径
+    let u;
+    try { u = new URL(url); } catch (e) { return ''; }
+    const p = u.pathname.replace(/\/+$/, '');
+    if (/\/chat\/completions$/i.test(p)) return url.replace(/\/+$/, '');
+    if (/\/completions$/i.test(p)) return url.replace(/\/+$/, '');
+    if (p === '' || p === '/') return u.origin + '/v1/chat/completions';
+    return u.origin + p + '/chat/completions';
   }
 
   function parseJsonObject(text, fallback) {
@@ -288,10 +298,158 @@
         log('响应用时 ' + cost + 'ms', text.slice(0, 200));
         cb(null, text, json);
       },
-      onerror() { cb(new Error('网络错误 / 被 CORS 或广告拦截插件阻断'), '', null); },
-      ontimeout() { cb(new Error('请求超时（60s）'), '', null); },
+      onerror(res) {
+        cb(new Error(buildNetworkHint(endpoint)), '', null);
+      },
+      ontimeout() { cb(new Error('请求超时（60s）· ' + endpoint + '\n模型可能太慢或中转站排队，可换更快的小模型'), '', null); },
       onabort() { cb(new Error('请求被中止'), '', null); },
     });
+  }
+
+  /** 网络层失败时给出可执行的排查提示，而不是干巴巴一句“网络错误” */
+  function buildNetworkHint(endpoint) {
+    const hints = ['网络错误 · 请求没到达服务端：' + endpoint];
+    let u;
+    try { u = new URL(endpoint); } catch (e) { return hints.join('\n'); }
+
+    const isLocal = /^(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])$/i.test(u.hostname);
+    if (isLocal) {
+      hints.push('');
+      hints.push('本地地址，最常见的三类原因：');
+      hints.push('1) 端口填错 / 服务没启动 —— 先确认该端口正在监听');
+      hints.push('2) 反代只监听 127.0.0.1 但端口不对');
+      hints.push('3) 服务要求 https 而这里用了 http');
+      hints.push('');
+      hints.push('排查：浏览器打开 ' + u.origin + '/v1/models 看是否返回 JSON');
+      hints.push('（返回 401 说明服务活着，只是缺 Key，属于正常）');
+    } else {
+      hints.push('');
+      hints.push('非本地地址：检查域名拼写、是否需科学上网、服务器是否放行该 IP');
+    }
+
+    if (location.protocol === 'https:' && u.protocol === 'http:' && !isLocal) {
+      hints.push('');
+      hints.push('⚠ 页面是 HTTPS，接口是 HTTP，浏览器会当混合内容拦截');
+    }
+    return hints.join('\n');
+  }
+
+  /**
+   * 逐步诊断：地址归一化 → 是否监听 → 鉴权 → 模型是否可用
+   * 返回一段人类可读的报告
+   */
+  function diagnose(cb) {
+    const raw = settings.baseUrl;
+    const endpoint = normalizeEndpoint(raw);
+    const lines = [];
+    lines.push('【1】地址归一化');
+    lines.push('  填写：' + (raw || '(空)'));
+    lines.push('  实际：' + (endpoint || '(空)'));
+    if (!endpoint) {
+      lines.push('  ✗ 地址为空，先填 API 地址');
+      cb(lines.join('\n'));
+      return;
+    }
+
+    let u;
+    try { u = new URL(endpoint); } catch (e) {
+      lines.push('  ✗ 地址不合法');
+      cb(lines.join('\n'));
+      return;
+    }
+    const base = u.origin;
+    const isLocal = /^(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])$/i.test(u.hostname);
+    lines.push('  协议：' + u.protocol + (location.protocol === 'https:' && u.protocol === 'http:' && !isLocal
+      ? '  ⚠ 与页面 HTTPS 混用，可能被拦截' : '  ok'));
+
+    lines.push('');
+    lines.push('【2】探测服务是否在线（GET ' + base + '/v1/models）');
+    // 流程：probeModels 直接调用一次 → 其回调走 next() → step=1 进入 probeChat
+    //                                                    → 其回调再走 next() → step=2 输出报告
+    let step = 0;
+    const next = () => {
+      step += 1;
+      if (step === 1) probeChat();
+      else cb(lines.join('\n'));
+    };
+
+    function probeModels() {
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url: base + '/v1/models',
+        headers: buildHeaders(),
+        timeout: 10000,
+        onload(res) {
+          if (res.status === 401 || res.status === 403) {
+            lines.push('  ✓ 端口有人监听（HTTP ' + res.status + ' = 服务活着，只是鉴权未通过）');
+            lines.push('    如果下面第 3 步也 401，说明 Key 不对或鉴权头不匹配');
+          } else if (res.status >= 200 && res.status < 300) {
+            lines.push('  ✓ 服务正常（HTTP ' + res.status + '）');
+            try {
+              const j = JSON.parse(res.responseText);
+              const ids = (j.data || j.models || []).map((m) => m.id || m.name).filter(Boolean);
+              if (ids.length) {
+                lines.push('  可用模型（前 12 个）：' + ids.slice(0, 12).join(', '));
+                if (settings.model && !ids.includes(settings.model)) {
+                  lines.push('  ⚠ 你填的模型「' + settings.model + '」不在列表里，可能是名字写错');
+                }
+              }
+            } catch (e) { /* 非标准 */ }
+          } else if (res.status === 404) {
+            lines.push('  ⚠ 端口有人监听，但没有 /v1/models（HTTP 404）');
+            lines.push('    可能是别的服务，或反代路径不是 /v1');
+          } else {
+            lines.push('  ⚠ 意外状态 HTTP ' + res.status);
+          }
+          next();
+        },
+        onerror() {
+          lines.push('  ✗ 连不上：端口没人监听 / 服务没启动 / 被防火墙拦截');
+          lines.push('    这条基本就是「网络错误」的直接原因');
+          next();
+        },
+        ontimeout() { lines.push('  ✗ 探测超时'); next(); },
+      });
+    }
+
+    function probeChat() {
+      lines.push('');
+      lines.push('【3】真实对话请求（POST ' + endpoint + '，model=' + settings.model + '）');
+      const body = buildBody('只回复两个字：正常', { maxTokens: 32, temperature: 0 });
+      GM_xmlhttpRequest({
+        method: 'POST',
+        url: endpoint,
+        headers: buildHeaders(),
+        data: JSON.stringify(body),
+        timeout: 45000,
+        onload(res) {
+          if (res.status >= 200 && res.status < 300) {
+            let text = '';
+            try { text = extractContent(JSON.parse(res.responseText)); } catch (e) { /* ignore */ }
+            lines.push('  ✓ 成功，模型回复：' + (text || '(空)'));
+          } else {
+            let detail = '';
+            try {
+              const j = JSON.parse(res.responseText);
+              detail = j?.error?.message || j?.message || j?.msg || '';
+            } catch (e) { detail = String(res.responseText || '').slice(0, 200); }
+            lines.push('  ✗ HTTP ' + res.status + ' · ' + detail);
+            if (res.status === 401) lines.push('    → Key 错误，或中转站要求自定义鉴权头（用「额外请求头 JSON」填 x-api-key 等）');
+            if (res.status === 404) lines.push('    → 路径不对，试试只填 ' + base + ' 让脚本自动补 /v1/chat/completions');
+            if (res.status === 400) lines.push('    → 多半是模型名不存在，对照第 2 步列出的可用模型');
+            if (res.status === 429) lines.push('    → 限流或额度耗尽');
+          }
+          next();
+        },
+        onerror() {
+          lines.push('  ✗ 连不上（同第 2 步原因）');
+          next();
+        },
+        ontimeout() { lines.push('  ✗ 超时，模型可能太慢'); next(); },
+      });
+    }
+
+    probeModels();
   }
 
   /* =========================================================================
@@ -615,8 +773,8 @@
       if (err) {
         state.busy = false;
         state.lastError = err.message;
-        setStatus('AI 请求失败：' + err.message, 'err');
-        setAnswerBox('');
+        setStatus('AI 请求失败：' + err.message.split('\n')[0], 'err');
+        setAnswerBox(err.message + '\n\n可点「🩺 诊断」逐项排查。');
         return;
       }
 
@@ -891,8 +1049,13 @@
       settings.provider = provSel.value;
       GM_setValue(SK + 'provider', provSel.value);
       if (p) {
-        saveSetting('baseUrl', p.baseUrl);
-        saveSetting('model', p.model);
+        // 选「自定义 / 中转站」时保留用户已填的地址，避免被示例地址覆盖
+        if (provSel.value !== 'custom') {
+          saveSetting('baseUrl', p.baseUrl);
+          saveSetting('model', p.model);
+        } else if (!settings.baseUrl || /your-relay\.example\.com/.test(settings.baseUrl)) {
+          saveSetting('baseUrl', '');
+        }
       }
       renderPanel();
     });
@@ -994,6 +1157,11 @@
     // —— 操作按钮 ——
     const ops = el('div', { class: 'btns' });
     ops.appendChild(el('button', {
+      text: '🩺 诊断',
+      title: '依次检查：地址归一化 / 端口是否在线 / 模型列表 / 真实对话',
+      onclick: () => runDiagnose(),
+    }));
+    ops.appendChild(el('button', {
       text: '🔌 测试接口',
       onclick: (e) => testConnection(e.target),
     }));
@@ -1016,6 +1184,17 @@
     renderPanelStats();
     setStatus(state.status);
     setAnswerBox(state.lastAnswer);
+  }
+
+  function runDiagnose() {
+    setStatus('诊断中，请稍候…', 'warn');
+    setAnswerBox('正在逐项检查接口…');
+    diagnose((report) => {
+      state.lastAnswer = report;
+      setAnswerBox(report);
+      const bad = report.includes('✗');
+      setStatus(bad ? '诊断完成：发现问题，见下方报告' : '诊断完成：接口可用', bad ? 'err' : 'ok');
+    });
   }
 
   function testConnection(btn) {
