@@ -2,13 +2,22 @@
 
 一个 Tampermonkey 用户脚本：实时监听雨课堂课堂里老师弹出的**随堂试题**，调用**任意 OpenAI 兼容接口**生成答案，并按需自动勾选、自动提交。
 
-> 与原版脚本最大的区别：**不再绑定 DeepSeek**。DeepSeek、OpenAI、通义千问、硅基流动、OpenRouter、Kimi、智谱 GLM、火山方舟，以及任何 one-api / new-api / 自建反代**中转站**，全部可用。
+> 与原版脚本最大的区别：**不再绑定 DeepSeek**。DeepSeek、OpenAI、通义千问、硅基流动、OpenRouter、Kimi、智谱 GLM、火山方舟，以及任何 one-api / new-api / 自建反代**中转站**、本地反代，全部可用。
+
+## ⚡ 一键安装
+
+**👉 [点我安装脚本](https://raw.githubusercontent.com/jzPPP3333/yuketang-live-quiz-ai/main/yuketang-live-quiz-ai.user.js)**
+
+[![安装](https://img.shields.io/badge/Tampermonkey-点击安装-4ade80?style=for-the-badge&logo=tampermonkey&logoColor=white)](https://raw.githubusercontent.com/jzPPP3333/yuketang-live-quiz-ai/main/yuketang-live-quiz-ai.user.js)
+
+> 首次点开若只看到一堆代码：说明还没装 Tampermonkey。装好插件后回来再点一次，就会弹出「安装」确认框。
+> 装过旧版也没关系，脚本已内置 `@updateURL`，Tampermonkey 会自动检测更新。
 
 ---
 
 ## 一、和旧版的差异
 
-| 项目 | 旧版（DeepSeek 专用） | 本版 v4.2 |
+| 项目 | 旧版（DeepSeek 专用） | 本版 v4.3 |
 | --- | --- | --- |
 | 接口地址 | 硬编码 `api.deepseek.com` | 任意 OpenAI 兼容地址，可填中转站 |
 | 模型名 | 仅 `deepseek-chat` / `deepseek-reasoner` | 任意模型名，带常用模型快捷按钮 |
@@ -16,22 +25,21 @@
 | 请求体 | 固定字段 | 支持 `extraBody` 合并任意字段（`top_p`、`thinking` 等） |
 | 响应解析 | 只认 `choices[0].message.content` | 兼容 `content` 数组 / `reasoning_content` / `data` 包裹 / Anthropic 原生 |
 | 配置方式 | 改代码 | 可视化面板 + GM 存储，改完即生效 |
-| 联通性 | 无 | 面板内「测试接口」一键探活 |
+| 排障 | 只有一句「网络错误」 | 「🩺 诊断」三步定位：地址 → 端口 → 鉴权 → 模型 |
 
 ---
 
 ## 二、安装
 
+### 方式 A：点链接（推荐）
+
 1. 浏览器安装 [Tampermonkey](https://www.tampermonkey.net/)（篡改猴 / 油猴）。
-2. 打开安装链接，弹窗点「安装」：
+2. 点上面的 **👉 点我安装脚本**，Tampermonkey 弹出确认页，点「安装」。
+3. 打开雨课堂网页版授课页面（`https://*.yuketang.cn/*`），右下角出现 **雨课堂 AI 助手 v4.3.0** 面板即成功。
 
-   ```
-   https://raw.githubusercontent.com/jzPPP3333/yuketang-live-quiz-ai/main/yuketang-live-quiz-ai.user.js
-   ```
+### 方式 B：手动
 
-   或者手动：Tampermonkey → 添加新脚本 → 把 `yuketang-live-quiz-ai.user.js` 全文粘进去 → `Ctrl+S`。
-
-3. 打开雨课堂网页版授课页面（`https://*.yuketang.cn/*`），右下角会出现**雨课堂 AI 助手**面板。
+Tampermonkey → 添加新脚本 → 清空模板 → 粘贴 [`yuketang-live-quiz-ai.user.js`](https://raw.githubusercontent.com/jzPPP3333/yuketang-live-quiz-ai/main/yuketang-live-quiz-ai.user.js) 全文 → `Ctrl+S`。
 
 ---
 
@@ -141,20 +149,69 @@ fireMouse(选项) → 等待 → 点击「提交」
 
 ## 六、常见问题
 
+### 「网络错误」到底怎么查
+
+点面板里的 **🩺 诊断**，它会依次跑三步并直接告诉你卡在哪：
+
+```
+【1】地址归一化
+  填写：http://127.0.0.1:8878/v1
+  实际：http://127.0.0.1:8878/v1/chat/completions
+  协议：http:  ok
+
+【2】探测服务是否在线（GET http://127.0.0.1:8878/v1/models）
+  ✗ 连不上：端口没人监听 / 服务没启动 / 被防火墙拦截
+    这条基本就是「网络错误」的直接原因
+
+【3】真实对话请求（POST ...，model=xxx）
+  ✗ 连不上（同第 2 步原因）
+```
+
+对照三种结果：
+
+| 第 2 步结果 | 含义 | 处理 |
+| --- | --- | --- |
+| `✗ 连不上` | **端口没人监听** | 服务没起，或端口号打错了。这是「网络错误」最主要的原因 |
+| `✓ HTTP 401` | 端口活着，只是没带对 Key | 正常，去看第 3 步 |
+| `✓ 服务正常` + 模型列表 | 完全通 | 若第 3 步仍失败，是对应模型名不对 |
+
+> 实测案例：填 `http://127.0.0.1:8878/v1` 报网络错误，而本机实际监听的是 **8788**（wb-proxy）。一字之差。
+
+其他高频原因：
+
+**Q：本地反代端口怎么确认？**
+A：PowerShell 里跑一条，看目标端口在不在列表：
+
+```powershell
+Get-NetTCPConnection -State Listen | Where-Object { $_.LocalPort -ge 8000 -and $_.LocalPort -le 9000 } |
+  Select-Object LocalAddress, LocalPort, OwningProcess | Sort-Object LocalPort
+```
+
+拿到 PID 再 `Get-Process -Id <PID>` 就知道是哪个程序。浏览器也可直接开 `http://127.0.0.1:<端口>/v1/models` —— 返回 JSON 或 401 都算活着，`ERR_CONNECTION_REFUSED` 才是真没起。
+
+**Q：页面是 https，接口是 http 本地地址，会被拦吗？**
+A：`GM_xmlhttpRequest` 走扩展层，正常不受混合内容限制。但若你用的是某些国内套壳浏览器或扩展被精简，可能仍被拦截 —— 诊断第 1 步会标出 `⚠ 与页面 HTTPS 混用`。
+
 **Q：提示「响应中没有可解析的文本」？**
-A：模型返回了非标准结构。打开「调试日志」看控制台里的原始响应；若中转站把结果包在 `data.result`，本版已在 `extractContent` 里做兼容，仍不行请提 Issue 附上脱敏后的响应体。
+A：模型返回了非标准结构。打开「调试日志」看控制台原始响应；`extractContent` 已兼容 `choices[0].message.content` / content 数组 / `reasoning_content` / `{data:{...}}` / Anthropic `content[]`，仍不行请提 Issue 附脱敏响应体。
 
 **Q：提示 HTTP 401 / 403？**
-A：Key 错误，或中转站要求非标准鉴权头。用「额外请求头 JSON」补上，同时把面板里的 API Key 留空避免冲突。
+A：Key 错误，或中转站要求非标准鉴权头。用「额外请求头 JSON」补上（如 `{"x-api-key":"sk-xxx"}`），同时把面板里的 API Key 留空避免冲突。
 
 **Q：提示 HTTP 404？**
-A：地址补错了。多数情况是把 `/v1` 写重了或漏了，直接填服务商根地址让脚本补全最稳。
+A：路径不对。只填 `http://host:port` 或 `http://host:port/v1`，让脚本自动补 `/v1/chat/completions` 最稳。
+
+**Q：提示 HTTP 400？**
+A：多半是模型名不存在。诊断第 2 步会列出服务端真实可用的模型名，照着改。
 
 **Q：`@connect *` 会不会不安全？**
 A：它只允许 Tampermonkey 向你在面板里填写的地址发请求，不放宽任何同源策略；Key 只存在本地 GM 存储，不会上传到任何第三方。
 
 **Q：为什么有时候抓到了题却不动？**
-A：雨课堂部分班型的选项不是标准 `el-radio` / `el-checkbox`，脚本找不到可点元素。此时面板会提示「页面上没找到可操作的控件」，参考答案仍然显示，手动点一下即可。
+A：雨课堂部分班型的选项不是标准 `el-radio` / `el-checkbox`，脚本找不到可点元素。此时面板提示「页面上没找到可操作的控件」，参考答案仍显示，手动点一下即可。
+
+**Q：选「自定义 / 中转站」后地址被清空了？**
+A：v4.3 起切到「自定义」会保留你已填的地址，只有原本还是示例占位地址时才会清空。
 
 ---
 
