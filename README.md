@@ -85,10 +85,6 @@ Tampermonkey → 添加新脚本 → 清空模板 → 粘贴 [`yuketang-live-qui
 {"top_p": 0.9, "enable_thinking": false}
 ```
 
-### 3.3 内网 / 本地反代
-
-配合 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)、[allproxyapi](https://github.com/jzPPP3333/allproxyapi)、LiteLLM、one-api 等自建网关完全可用，地址填 `http://127.0.0.1:8317/v1/chat/completions` 这类本机地址即可（Tampermonkey 的 `@connect *` 已放开跨域）。
-
 ---
 
 ## 四、使用
